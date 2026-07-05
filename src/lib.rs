@@ -49,6 +49,8 @@ pub struct Terminal {
     _reader: JoinHandle<()>,
     _writer: JoinHandle<()>,
     exit_code: Option<u32>,
+    on_exit: Option<Box<dyn FnMut(u32)>>,
+    exit_notified: bool,
 }
 
 impl Terminal {
@@ -133,6 +135,8 @@ impl Terminal {
             _reader: reader_thread,
             _writer: writer_thread,
             exit_code: None,
+            on_exit: None,
+            exit_notified: false,
         })
     }
 
@@ -173,7 +177,35 @@ impl Terminal {
         Ok(())
     }
 
-    /// The shell's exit code once it has exited, else `None`. Latches.
+    /// Register a callback fired once, from [`Terminal::poll`], when the shell
+    /// exits (e.g. the user typed `exit`). The argument is the exit code.
+    ///
+    /// Fires on whatever thread calls `poll` — for a Slint host that is the UI
+    /// thread. Do **not** drop this `Terminal` from inside the callback (it is
+    /// borrowed while `poll` runs); instead signal the host to tear it down
+    /// after `poll` returns (see the crate README embedding notes).
+    pub fn set_on_exit(&mut self, cb: impl FnMut(u32) + 'static) {
+        self.on_exit = Some(Box::new(cb));
+    }
+
+    /// Drive one housekeeping step: detect shell exit and fire the [`set_on_exit`]
+    /// callback exactly once. Call this each UI tick (alongside rendering).
+    ///
+    /// [`set_on_exit`]: Terminal::set_on_exit
+    pub fn poll(&mut self) {
+        if self.exit_notified {
+            return;
+        }
+        if let Some(code) = self.exit_code() {
+            self.exit_notified = true;
+            if let Some(mut cb) = self.on_exit.take() {
+                cb(code);
+            }
+        }
+    }
+
+    /// The shell's exit code once it has exited, else `None`. Latches. Pure
+    /// getter — for callback-driven exit handling use [`Terminal::poll`].
     pub fn exit_code(&mut self) -> Option<u32> {
         if self.exit_code.is_some() {
             return self.exit_code;
@@ -205,5 +237,15 @@ impl Terminal {
         let c = (px_w as usize / self.cell_w).max(1);
         let r = (px_h as usize / self.cell_h).max(1);
         (c, r)
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        // Kill the shell so the reader thread hits EOF and exits; dropping
+        // `input_tx` ends the writer thread. Both are detached and finish on
+        // their own. This matters when a host tears the terminal down while
+        // the shell is still running (e.g. a "Back" button), not just on exit.
+        self.pty.kill();
     }
 }

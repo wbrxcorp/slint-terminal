@@ -91,4 +91,10 @@ impl Pty {
             _ => None,
         }
     }
+
+    /// Terminate the shell process (best effort). Safe to call after it has
+    /// already exited.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
 }

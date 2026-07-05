@@ -23,6 +23,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.window()
         .set_size(slint::PhysicalSize::new(px_w, px_h));
 
+    // Quit the app when the shell exits (e.g. the user typed `exit`).
+    terminal
+        .borrow_mut()
+        .set_on_exit(|_code| {
+            let _ = slint::quit_event_loop();
+        });
+
     // Keyboard -> PTY.
     {
         let terminal = terminal.clone();
@@ -62,9 +69,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_frame(slint_glue::rgba_to_image(rgba, w, h));
                 }
 
-                if term.exit_code().is_some() {
-                    let _ = slint::quit_event_loop();
-                }
+                // Fire the on-exit callback once if the shell has exited.
+                term.poll();
             },
         );
     }

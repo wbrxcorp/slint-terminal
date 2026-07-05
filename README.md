@@ -96,6 +96,203 @@ slint-terminal = { git = "https://github.com/wbrxcorp/slint-terminal", tag = "v0
   slint-terminal = { path = "../slint-terminal" }
   ```
 
+## 公開 API（現状）
+
+**コア（`slint_terminal::Terminal`／slint 非依存）:**
+
+```rust
+// 生成: cols×rows セル, フォント px, 起動プログラム(None=$SHELL)
+Terminal::new(cols: usize, rows: usize, font_px: f32, program: Option<&str>)
+    -> Result<Terminal, String>
+
+term.feed_input(&self, bytes: &[u8])          // 端末へ入力バイト列を送る
+term.take_dirty(&self) -> bool                // 前回描画以降に変化があったか(取得でクリア)
+term.render(&mut self) -> (&[u8], u32, u32)   // 現在のグリッドを RGBA へ。(buf, w, h)
+term.resize(&mut self, cols, rows) -> Result<(), String>  // グリッド+PTY を同時リサイズ
+term.set_on_exit(&mut self, cb: impl FnMut(u32) + 'static) // シェル終了コールバック登録
+term.poll(&mut self)                          // 終了検知して on_exit を1回だけ発火(毎tick呼ぶ)
+term.exit_code(&mut self) -> Option<u32>      // 終了コード(ラッチ)。poll を使わない場合用
+term.cell_size() -> (usize, usize)            // 1セルのピクセル寸法
+term.grid_size() -> (usize, usize)            // 現在の (cols, rows)
+term.pixel_size() -> (u32, u32)               // グリッド全体のピクセル寸法
+term.cells_for_pixels(px_w, px_h) -> (usize, usize) // ピクセル領域に収まるセル数
+```
+
+- スレッド安全性: PTY 入出力は内部ワーカースレッド。グリッドは内部 Mutex で保護。
+  `render`/`resize`/`poll`/`exit_code` は UI（描画）スレッドから呼ぶ。`feed_input`/`take_dirty` はどこからでも可。
+- `Terminal` を drop するとシェルを kill し、ワーカースレッドも自然終了する（`exit` で終わった後でも、
+  実行中に「戻る」で破棄しても安全）。
+- `on_exit` は `poll` を呼んだスレッド（Slint ホストでは UI スレッド）で発火する。
+  **コールバック内から `Terminal` を drop してはいけない**（`poll` 実行中は借用されている）。
+  ホスト側で「戻る」ナビゲーションのフラグを立て、`poll` から戻った後に破棄すること（下記レシピ参照）。
+
+**slint feature（`slint_terminal::slint_glue`）:**
+
+```rust
+slint_glue::rgba_to_image(rgba: &[u8], w: u32, h: u32) -> slint::Image
+slint_glue::key_to_bytes(text: &str, ctrl: bool, alt: bool) -> Option<Vec<u8>>
+//   Slint KeyEvent の text + 修飾フラグ → 端末入力バイト列。
+//   名前付き/方向キー→VTシーケンス, Ctrl+英字/記号→C0制御, Alt→ESC前置,
+//   修飾キー単独や未対応特殊キーは None（PTY に生コードを流さない）。
+```
+
+## genpack-install-gui への組み込み（実装担当向け）
+
+需要者 `genpack-install-gui`（`wbrxcorp/genpack-install-gui`）には既に `Page.terminal` の
+プレースホルダがある（`ui/main.slint`、コメントに「PTY + alacritty-terminal + fontdue →
+Slint Image、`exit` で戻る」構想）。ここを本クレートで実装する。**slint 版は両者とも緩い `"1"`
+指定で同一版に解決される**ので型は繋がる（`backend-winit` + `backend-linuxkms` も共通）。
+
+### 1) 依存追加（`genpack-install-gui/Cargo.toml`）
+
+```toml
+slint-terminal = { git = "https://github.com/wbrxcorp/slint-terminal", tag = "v0.1.0" }
+# 並行開発中はローカル patch:
+# [patch."https://github.com/wbrxcorp/slint-terminal"]
+# slint-terminal = { path = "../slint-terminal" }
+```
+
+### 2) `.slint`（`Page.terminal` のプレースホルダを置換）
+
+`MainWindow` に次を追加し、端末ページを Image + FocusScope にする:
+
+```slint
+in property <image> term-frame;
+callback term-key(string, bool, bool);      // text, ctrl, alt
+callback term-area-resized(length, length); // 論理サイズ通知（リサイズ対応する場合）
+
+if page == Page.terminal: FocusScope {
+    // ページ表示時にフォーカスを取る（forward-focus か init で focus() を）。
+    key-pressed(event) => {
+        root.term-key(event.text, event.modifiers.control, event.modifiers.alt);
+        accept
+    }
+    term-img := Image {
+        source: root.term-frame;
+        image-rendering: pixelated;   // 1:1、テキストなので平滑化しない
+        width: 100%; height: 100%;
+        // サイズが決まったら Rust に論理サイズを渡す（リサイズ追従する場合）
+        changed width => { root.term-area-resized(self.width, self.height); }
+        changed height => { root.term-area-resized(self.width, self.height); }
+    }
+}
+```
+
+`exit` で戻る挙動は Rust 側 `on_exit` で `page = Page.disk-select` に戻す（プレースホルダの
+「Type 'exit' to return」に一致）。
+
+### 3) Rust 側（`src/main.rs`）
+
+端末は**ページに入った時に遅延生成**し、抜ける時に破棄する（root 権限のシェルを常駐させない）。
+
+```rust
+use std::cell::RefCell;
+use std::rc::Rc;
+use slint_terminal::{slint_glue, Terminal};
+
+let term_cell: Rc<RefCell<Option<Terminal>>> = Rc::new(RefCell::new(None));
+
+// 端末ページへ入る導線（既存: メニュー id==1 で page = Page.terminal にしている箇所）で生成。
+// 生成サイズは描画領域の物理ピクセルから決める（スケールファクタ考慮、下記「注意」）。
+{
+    let cell = term_cell.clone();
+    let w = window.as_weak();
+    window.on_enter_terminal(move || {           // 適宜コールバックを新設 or 既存導線に挿入
+        let Some(win) = w.upgrade() else { return };
+        let scale = win.window().scale_factor();
+        // 端末領域の論理サイズ×scale = 物理ピクセル。まだ未確定なら暫定 80x24 で作り、
+        // term-area-resized 受信時に resize する運用でよい。
+        let mut t = Terminal::new(80, 24, 16.0, None).expect("terminal");
+        let w2 = w.clone();
+        t.set_on_exit(move |_code| {
+            // ここで Terminal を drop しない。ページを戻すだけ。破棄は tick 側で。
+            if let Some(win) = w2.upgrade() { win.set_page(Page::DiskSelect); }
+        });
+        *cell.borrow_mut() = Some(t);
+        win.set_page(Page::Terminal);
+    });
+}
+
+// キー入力 → PTY
+{
+    let cell = term_cell.clone();
+    window.on_term_key(move |text, ctrl, alt| {
+        if let Some(t) = cell.borrow().as_ref() {
+            if let Some(bytes) = slint_glue::key_to_bytes(text.as_str(), ctrl, alt) {
+                t.feed_input(&bytes);
+            }
+        }
+    });
+}
+
+// 描画領域サイズ通知 → グリッドを合わせる（リサイズ追従する場合）
+{
+    let cell = term_cell.clone();
+    let w = window.as_weak();
+    window.on_term_area_resized(move |lw, lh| {
+        let Some(win) = w.upgrade() else { return };
+        let scale = win.window().scale_factor();
+        if let Some(t) = cell.borrow_mut().as_mut() {
+            let (cols, rows) = t.cells_for_pixels((lw * scale) as u32, (lh * scale) as u32);
+            let _ = t.resize(cols, rows);
+        }
+    });
+}
+
+// 毎フレームの駆動: 16ms タイマ（端末ページの間だけ実質動く）
+let term_timer = slint::Timer::default();
+{
+    let cell = term_cell.clone();
+    let w = window.as_weak();
+    term_timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(16), move || {
+        let Some(win) = w.upgrade() else { return };
+        let mut guard = cell.borrow_mut();
+        let Some(t) = guard.as_mut() else { return };
+        t.poll();                                  // ここで on_exit が発火しうる（page が戻る）
+        if t.take_dirty() {
+            let (rgba, iw, ih) = t.render();
+            win.set_term_frame(slint_glue::rgba_to_image(rgba, iw, ih));
+        }
+        // 端末ページを抜けていたら破棄（on_exit 由来 or 「戻る」ボタン由来）。
+        // drop は poll の外＝ここで行うので借用衝突しない。
+        if win.get_page() != Page::Terminal {
+            *guard = None;
+        }
+    });
+}
+```
+
+- `term_timer` はプログラム全体で 1 本持ち回しでよい（`Terminal` が無い間は即 return するので軽い）。
+- 「戻る」ボタンは `page = Page.disk-select` にするだけでよい（破棄は tick が拾う）。
+
+### 注意（スケールファクタ ＝ KMS 実機で最重要）
+
+`genpack-install-gui` は生 KMS で**論理/物理を分けてスケールファクタを動的設定**している
+（`desired_kms_scale`）。ターミナルは**物理ピクセル解像度で栅化し、論理サイズの Image に流す**と
+1:1 で綺麗に出る。したがって:
+
+- グリッドの `cols/rows` は **描画領域の論理サイズ × `window().scale_factor()`（＝物理px）** から
+  `cells_for_pixels()` で求める。
+- Image は論理サイズ（`width/height: 100%`）で置き、`image-rendering: pixelated`。
+  Slint がソース（物理px）を要素（論理）へ 1:1 マップしてフレームバッファに描く。
+- スケール変更（`ScaleFactorChanged`）時は `term-area-resized` が再発火するので resize が追従する。
+- まず固定 80×24 で通し、リサイズ追従は後追いでも可。ただし KMS 実機は 720p〜4K まで幅があるので
+  最終的には物理px 由来のサイズ決定を入れること。
+
+### スレッドモデルの整合
+
+本クレートは PTY I/O を内部ワーカースレッドで回すので、`genpack-install-gui` の
+`run_busy`/`invoke_from_event_loop` パターンとは独立して動く。端末描画は上記 16ms タイマ
+（UI スレッド）だけで完結し、busy オーバーレイとも干渉しない。`Terminal` 生成/破棄・
+`render`/`resize`/`poll` は UI スレッドから呼ぶこと。
+
+### 環境まわり
+
+- 起動プログラムは `Terminal::new(.., program)` で指定。`None` で `$SHELL`（無ければ `/bin/sh`）。
+  インストーラで特定シェルを使いたければ `Some("/bin/bash")` 等を渡す。
+- コアが `TERM=xterm-256color` を設定し、cwd はホストプロセスから継承する。
+- フォントは fontconfig の `monospace`（実機は `Noto Sans Mono CJK JP`）を自動解決。絵文字は非対応。
+
 ## 設計メモ・落とし穴
 
 - **スレッド境界**: PTY 読み取りはワーカースレッド。UI 反映は `slint::invoke_from_event_loop`
@@ -104,8 +301,9 @@ slint-terminal = { git = "https://github.com/wbrxcorp/slint-terminal", tag = "v0
 - **リサイズ**: ウィンドウ/セル数変更時に PTY を `TIOCSWINSZ` でリサイズし、端末状態も追随。
 - **入力マッピング**: Slint の `KeyEvent` → 端末入力バイト列（特殊キー・修飾キー・矢印/Fキー等）。
   ここが一番地味に手間がかかる。
-- **シェル終了通知**: シェルが exit したらホスト側へコールバックで通知（genpack では
-  「exit で GUI 画面に戻る」を実現するため）。
+- **シェル終了通知**: `Terminal::set_on_exit` で登録し `Terminal::poll` を毎tick呼ぶと、シェル
+  exit 時にホストへ通知（genpack の「exit で GUI 画面に戻る」用）。実装済み。コールバック内から
+  `Terminal` を drop しない点に注意（上記「組み込み」参照）。
 - **slint 版結合**: 上記のとおり slint は feature に隔離、依存は緩く。
 
 ## 参考・開発コンテキスト（コールドスタート時にまず見る）
@@ -125,6 +323,7 @@ slint-terminal = { git = "https://github.com/wbrxcorp/slint-terminal", tag = "v0
 **最小 PoC 実装済み・実機動作確認済み**（fontdue ベース）。
 スタンドアロンアプリで「PTY → alacritty-terminal → fontdue ラスタライズ → Slint `Image`」の
 一巡が通り、シェル入力・日本語（CJK, 全角=2セル）表示・Ctrl 系キー（Ctrl+C 等）・方向キーが動作する。
+シェル終了コールバック（`set_on_exit`/`poll`）も実装済みで、`exit` でホストへ通知できる。
 
 構成:
 
@@ -155,8 +354,9 @@ ui/main.slint     Image 1 枚 + FocusScope
 
 ### 次の候補
 
-lib/bin と feature の整理（現状 lib はほぼ整理済み）、シェル終了コールバックの公開 API 化、
-需要者 `genpack-install-gui` への git 依存での組み込み検証。
+需要者 `genpack-install-gui` への実組み込み（上記レシピに沿って `Page.terminal` を実装）と
+KMS 実機での 1:1 描画・スケール追従の検証。装飾（太字/下線）・カーソル形状・F キー・
+絵文字（cosmic-text 経路）は必要に応じて追加。
 
 ## ライセンス
 
