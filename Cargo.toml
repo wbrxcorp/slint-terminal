@@ -1,0 +1,36 @@
+[package]
+name = "slint-terminal"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only OR LicenseRef-Slint-Royalty-Free OR LicenseRef-Slint-Commercial"
+description = "Reusable terminal emulator for Slint (framework-agnostic core + optional slint glue)"
+repository = "https://github.com/wbrxcorp/slint-terminal"
+
+[lib]
+name = "slint_terminal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "slint-terminal"
+path = "src/bin/slint-terminal.rs"
+required-features = ["slint"]
+
+[features]
+default = ["slint"]
+# Optional Slint glue: RGBA -> slint::Image conversion and KeyEvent -> input bytes.
+# Kept loose ("1") so the consuming app resolves it to the same slint version.
+slint = ["dep:slint", "dep:slint-build"]
+
+[dependencies]
+# Framework-agnostic core
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+fontdue = "0.9"
+unicode-width = "0.2"
+
+# Slint glue (only pulled in with the "slint" feature)
+slint = { version = "1", optional = true }
+
+[build-dependencies]
+# Compiles ui/main.slint for the standalone binary. Only used with "slint".
+slint-build = { version = "1", optional = true }

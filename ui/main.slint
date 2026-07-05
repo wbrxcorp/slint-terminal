@@ -1,0 +1,30 @@
+// Standalone harness UI: one Image the host swaps every frame, wrapped in a
+// FocusScope that forwards key text to Rust. Deliberately minimal — the library
+// path does the same on the consumer side.
+
+export component MainWindow inherits Window {
+    title: "slint-terminal";
+    // The current terminal frame, replaced each render tick from Rust.
+    in property <image> frame;
+    // Emitted on every key press: the KeyEvent text plus ctrl/alt modifier state.
+    callback key(string /* text */, bool /* ctrl */, bool /* alt */);
+
+    forward-focus: scope;
+
+    background: #101010;
+
+    scope := FocusScope {
+        key-pressed(event) => {
+            root.key(event.text, event.modifiers.control, event.modifiers.alt);
+            accept
+        }
+
+        Image {
+            source: root.frame;
+            // 1:1 pixels — no smoothing, this is a text grid.
+            image-rendering: pixelated;
+            width: 100%;
+            height: 100%;
+        }
+    }
+}
