@@ -249,8 +249,20 @@ cargo run --release --example bench_render   # 描画パスの簡易ベンチ（
 
 ## ライセンス
 
-`GPL-3.0-only OR LicenseRef-Slint-Royalty-Free OR LicenseRef-Slint-Commercial`。
+本プロジェクトは以下のいずれかを利用者が選択できるデュアルライセンス:
 
-**注意:** `slint` feature を有効にすると Slint の三択ライセンス（GPLv3 / Royalty-Free / 商用）の
-考慮が利用側にも及ぶ（"Made with Slint" の帰属表示、または GPLv3）。`default-features = false` の
-slint 非依存コアだけを使う経路にはこの影響はない。
+- MIT license（[LICENSE-MIT](LICENSE-MIT)）
+- Apache License 2.0（[LICENSE-APACHE](LICENSE-APACHE)）
+
+`SPDX: MIT OR Apache-2.0`
+
+**Slint 依存についての注意:** `slint` feature を有効にすると、最終成果物には Slint 本体が
+リンクされ、その配布は **Slint の三択ライセンス（GPLv3 / "Made with Slint" 帰属の Royalty-Free /
+商用）のいずれか**に従う必要がある（これは配布者の義務であり、本プロジェクト自身の MIT/Apache-2.0
+とは独立・両立する）。`default-features = false` の slint 非依存コアだけを使う経路には Slint 由来の
+制約はかからない。
+
+### Contribution
+
+明示的に別段の意思表示をしない限り、あなたが本プロジェクトへの取り込みを意図して提出した貢献は、
+Apache-2.0 license の定義に従い、追加の条項なしに上記のとおりデュアルライセンスされるものとします。

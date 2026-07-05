@@ -2,7 +2,7 @@
 name = "slint-terminal"
 version = "0.1.0"
 edition = "2021"
-license = "GPL-3.0-only OR LicenseRef-Slint-Royalty-Free OR LicenseRef-Slint-Commercial"
+license = "MIT OR Apache-2.0"
 description = "Reusable terminal emulator for Slint (framework-agnostic core + optional slint glue)"
 repository = "https://github.com/wbrxcorp/slint-terminal"
 
